@@ -58,6 +58,26 @@ type ClientConfiguration struct {
 	Logger        *log.Logger
 }
 
+// Modbus file read request object
+type FileReadReq struct {
+	// Zero-based index indentifying the file
+	FileNumber    uint16
+	// Zero-based index of the record (2-byte word) starting to read, must be less than 10000
+	RecordNumber  uint16
+	// The number of records to read
+	RecordCount   uint16
+}
+
+// Modbus file data block object
+type FileDataBlock struct {
+	// Zero-based index indentifying the file
+	FileNumber    uint16
+	// Zero-based index of the record (2-byte word) starting the data block, must be less than 10000
+	RecordNumber  uint16
+	// The file data block
+	Data          []byte
+}
+
 // Modbus client object.
 type ModbusClient struct {
 	conf          ClientConfiguration
@@ -871,9 +891,9 @@ func (mc *ModbusClient) WriteRawBytes(addr uint16, values []byte) (err error) {
 	return
 }
 
-// Reads content of a file given its file number, starting record to read and number of records to read.
-// Returns content of the file starting from the given record number till end of file or number of records to read.
-func (mc *ModbusClient) ReadFileRecord(fileNumber uint16, recNumber uint16, recCount uint16) (bytes []byte, err error) {
+// Reads content of multiple files given their file number, the starting record to read and the number of records to read.
+// Returns content of the files starting from the given record number till end of file or the number of records to read.
+func (mc *ModbusClient) ReadFileRecord(fileBlocks []FileReadReq) (fileData []FileDataBlock, err error) {
 	var req *pdu
 	var res *pdu
 
@@ -886,28 +906,33 @@ func (mc *ModbusClient) ReadFileRecord(fileNumber uint16, recNumber uint16, recC
 		functionCode: fcReadFileRecord,
 	}
 
-	if recCount == 0 || recCount > 124 {
+	// check the number of file blocks requested
+	numFileBlocks := len(fileBlocks)
+	if numFileBlocks == 0 || numFileBlocks > 35 {
 		err = ErrUnexpectedParameters
-		mc.logger.Error("recCount must be between 1 and 124")
-		return
-	}
-
-	if recNumber + recCount > 10000 {
-		err = ErrUnexpectedParameters
-		mc.logger.Error("a file cannot have more than 10000 records")
+		mc.logger.Error("the number of file blocks requested must be between 1 and 35")
 		return
 	}
 
 	// byte count
-	req.payload = append(req.payload, byte(7))
-	// reference type
-	req.payload = append(req.payload, byte(6))
-	// file number
-	req.payload = append(req.payload, uint16ToBytes(BIG_ENDIAN, fileNumber)...)
-	// record number
-	req.payload = append(req.payload, uint16ToBytes(BIG_ENDIAN, recNumber)...)
-	// record length
-	req.payload = append(req.payload, uint16ToBytes(BIG_ENDIAN, recCount)...)
+	req.payload = append(req.payload, byte(7 * numFileBlocks))
+	for _, fileBlock := range fileBlocks {
+		// sanity check on record number and record count
+		if fileBlock.RecordNumber + fileBlock.RecordCount > 10000 {
+			err = ErrUnexpectedParameters
+			mc.logger.Error("a file cannot have more than 10000 records")
+			return
+		}
+
+		// reference type
+		req.payload = append(req.payload, byte(6))
+		// file number
+		req.payload = append(req.payload, uint16ToBytes(BIG_ENDIAN, fileBlock.FileNumber)...)
+		// record number
+		req.payload = append(req.payload, uint16ToBytes(BIG_ENDIAN, fileBlock.RecordNumber)...)
+		// record length
+		req.payload = append(req.payload, uint16ToBytes(BIG_ENDIAN, fileBlock.RecordCount)...)
+	}
 
 	// run the request across the transport and wait for a response
 	res, err = mc.executeRequest(req)
@@ -918,33 +943,64 @@ func (mc *ModbusClient) ReadFileRecord(fileNumber uint16, recNumber uint16, recC
 	// validate the response code
 	switch {
 	case res.functionCode == req.functionCode:
-		// make sure the payload length is valid
-		// (1 byte of response data length + 1 byte of file data length + 1 byte of reference type + 2 bytes per record)
-		if len(res.payload) < 1 + 1 + 1 + 2 || len(res.payload) % 2 != 1 {
+		// check if the payload length is greater than this minimum size:
+		// 1-byte response data length + (1-byte file data length + 1-byte reference type + 0-byte record) * number of records
+		payloadLen := len(res.payload)
+		if payloadLen < 1 + ((1 + 1 + 0) * numFileBlocks) || payloadLen % 2 != 1 {
 			err = ErrProtocolError
+			mc.logger.Warningf("unexpected response payload length (%d)", payloadLen)
 			return
 		}
 
 		// validate response data length
-		if res.payload[0] != byte(len(res.payload) - 1) {
+		if int(res.payload[0] + 1) != payloadLen {
 			err = ErrProtocolError
+			mc.logger.Warningf("unexpected response data length (%d)", res.payload[0])
 			return
 		}
 
-		// validate file data length
-		if res.payload[1] != byte(len(res.payload) - 1 - 1) {
-			err = ErrProtocolError
-			return
+		// parse the response data
+		fileData = make([]FileDataBlock, numFileBlocks)
+		offset := 1
+		for i := 0; i < numFileBlocks; i++ {
+			// validate response data length
+			if offset + 2 > payloadLen {
+				err = ErrProtocolError
+				mc.logger.Warningf("file data length is not enough (%d)", payloadLen - offset)
+				return
+			}
+
+			// validate file block length
+			blockLength := int(res.payload[offset])
+			offset++
+			if blockLength % 2 != 1 || offset + blockLength > payloadLen {
+				err = ErrProtocolError
+				mc.logger.Warningf("unexpected file block length (%d)", blockLength)
+				return
+			}
+
+			// validate reference type
+			refType := res.payload[offset]
+			offset++
+			if refType != 6 {
+				err = ErrProtocolError
+				mc.logger.Warningf("unexpected reference type (%d)", refType)
+				return
+			}
+
+			// get file data
+			fileData[i].FileNumber = fileBlocks[i].FileNumber
+			fileData[i].RecordNumber = fileBlocks[i].RecordNumber
+			fileData[i].Data = res.payload[offset : offset + blockLength - 1]
+			offset += blockLength - 1
 		}
 
-		// validate reference type
-		if res.payload[2] != 6 {
+		// Total length of all file data must match with the response payload length
+		if offset != payloadLen {
 			err = ErrProtocolError
+			mc.logger.Warningf("unexpected total file data length (%d)", offset)
 			return
 		}
-
-		// remove all overhead from the returned slice
-		bytes = res.payload[3:]
 
 	case res.functionCode == (req.functionCode | 0x80):
 		if len(res.payload) != 1 {
@@ -964,7 +1020,7 @@ func (mc *ModbusClient) ReadFileRecord(fileNumber uint16, recNumber uint16, recC
 
 // Writes content of a file given its file number, starting record to write and the data to write.
 // The content to write to the file is passed as bytes, length of the content must be an even number.
-func (mc *ModbusClient) WriteFileRecord(fileNumber uint16, recNumber uint16, bytes []byte) (err error) {
+func (mc *ModbusClient) WriteFileRecord(fileData FileDataBlock) (err error) {
 	var req        *pdu
 	var res        *pdu
 	var dataLength uint16
@@ -973,7 +1029,7 @@ func (mc *ModbusClient) WriteFileRecord(fileNumber uint16, recNumber uint16, byt
 	mc.lock.Lock()
 	defer mc.lock.Unlock()
 
-	dataLength = uint16(len(bytes))
+	dataLength = uint16(len(fileData.Data))
 	recCount   = dataLength / 2
 
 	if dataLength % 2 != 0 {
@@ -982,7 +1038,7 @@ func (mc *ModbusClient) WriteFileRecord(fileNumber uint16, recNumber uint16, byt
 		return
 	}
 
-	if recNumber + recCount > 10000 {
+	if fileData.RecordNumber+recCount > 10000 {
 		err = ErrUnexpectedParameters
 		mc.logger.Error("a file cannot have more than 10000 records")
 		return
@@ -1005,13 +1061,13 @@ func (mc *ModbusClient) WriteFileRecord(fileNumber uint16, recNumber uint16, byt
 	// reference type
 	req.payload = append(req.payload, byte(6))
 	// file number
-	req.payload = append(req.payload, uint16ToBytes(BIG_ENDIAN, fileNumber)...)
+	req.payload = append(req.payload, uint16ToBytes(BIG_ENDIAN, fileData.FileNumber)...)
 	// record number
-	req.payload = append(req.payload, uint16ToBytes(BIG_ENDIAN, recNumber)...)
+	req.payload = append(req.payload, uint16ToBytes(BIG_ENDIAN, fileData.FileNumber)...)
 	// record length
 	req.payload = append(req.payload, uint16ToBytes(BIG_ENDIAN, recCount)...)
 	// record data
-	req.payload = append(req.payload, bytes...)
+	req.payload = append(req.payload, fileData.Data...)
 
 	// run the request across the transport and wait for a response
 	res, err = mc.executeRequest(req)
