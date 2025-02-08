@@ -74,7 +74,7 @@ type FileDataBlock struct {
 	FileNumber    uint16
 	// Zero-based index of the record (2-byte word) starting the data block, must be less than 10000
 	RecordNumber  uint16
-	// The file data block
+	// The file data block, length must be an even number and less than 245 bytes
 	Data          []byte
 }
 
@@ -1018,56 +1018,68 @@ func (mc *ModbusClient) ReadFileRecord(fileBlocks []FileReadReq) (fileData []Fil
 	return
 }
 
-// Writes content of a file given its file number, starting record to write and the data to write.
-// The content to write to the file is passed as bytes, length of the content must be an even number.
-func (mc *ModbusClient) WriteFileRecord(fileData FileDataBlock) (err error) {
-	var req        *pdu
-	var res        *pdu
-	var dataLength uint16
-	var recCount   uint16
+// Writes content of multiple files given their file number, starting record to write and the data to write.
+// The content to write to the files is passed as bytes, length of the content must be an even number.
+func (mc *ModbusClient) WriteFileRecord(fileDataBlocks []FileDataBlock) (err error) {
+	var req *pdu
+	var res *pdu
 
 	mc.lock.Lock()
 	defer mc.lock.Unlock()
 
-	dataLength = uint16(len(fileData.Data))
-	recCount   = dataLength / 2
-
-	if dataLength % 2 != 0 {
-		err = ErrUnexpectedParameters
-		mc.logger.Error("length of the data to write must be an even number")
-		return
-	}
-
-	if fileData.RecordNumber+recCount > 10000 {
-		err = ErrUnexpectedParameters
-		mc.logger.Error("a file cannot have more than 10000 records")
-		return
-	}
-
-	if recCount > 122 {
-		err = ErrUnexpectedParameters
-		mc.logger.Error("quantity of records exceeds 122")
-		return
-	}
-
 	// create and fill in the request object
-	req	= &pdu{
-		unitId:	      mc.unitId,
+	req = &pdu{
+		unitId:       mc.unitId,
 		functionCode: fcWriteFileRecord,
 	}
 
-	// byte count
-	req.payload = append(req.payload, byte(7 + dataLength))
-	// reference type
-	req.payload = append(req.payload, byte(6))
-	// file number
-	req.payload = append(req.payload, uint16ToBytes(BIG_ENDIAN, fileData.FileNumber)...)
-	// record number
-	req.payload = append(req.payload, uint16ToBytes(BIG_ENDIAN, fileData.FileNumber)...)
-	// record length
-	req.payload = append(req.payload, uint16ToBytes(BIG_ENDIAN, recCount)...)
-	// record data
-	req.payload = append(req.payload, fileData.Data...)
+	// placeholder for request data length
+	req.payload = append(req.payload, 0)
+
+	// construct the request payload
+	for _, fileData := range fileDataBlocks {
+		dataLength := uint16(len(fileData.Data))
+		recCount := dataLength / 2
+
+		if dataLength % 2 != 0 {
+			err = ErrUnexpectedParameters
+			mc.logger.Error("length of the data to write must be an even number")
+			return
+		}
+
+		if fileData.RecordNumber + recCount > 10000 {
+			err = ErrUnexpectedParameters
+			mc.logger.Error("a file cannot have more than 10000 records")
+			return
+		}
+
+		if recCount > 122 {
+			err = ErrUnexpectedParameters
+			mc.logger.Error("length of the data to write exceeds 244 bytes")
+			return
+		}
+
+		// reference type
+		req.payload = append(req.payload, byte(6))
+		// file number
+		req.payload = append(req.payload, uint16ToBytes(BIG_ENDIAN, fileData.FileNumber)...)
+		// record number
+		req.payload = append(req.payload, uint16ToBytes(BIG_ENDIAN, fileData.RecordNumber)...)
+		// record length
+		req.payload = append(req.payload, uint16ToBytes(BIG_ENDIAN, recCount)...)
+		// record data
+		req.payload = append(req.payload, fileData.Data...)
+
+		// payload length must not exceed 252 bytes
+		if len(req.payload) > 252 {
+			err = ErrUnexpectedParameters
+			mc.logger.Error("length of the request payload exceeds 252 bytes")
+			return
+		}
+	}
+
+	// set the request data length
+	req.payload[0] = byte(len(req.payload) - 1)
 
 	// run the request across the transport and wait for a response
 	res, err = mc.executeRequest(req)
@@ -1081,6 +1093,7 @@ func (mc *ModbusClient) WriteFileRecord(fileData FileDataBlock) (err error) {
 		// make sure the payload length of the response is same as that of the request
 		if len(res.payload) != len(req.payload) {
 			err = ErrProtocolError
+			mc.logger.Warningf("payload length of the response (%d) is not same as that of the request", res.payload)
 			return
 		}
 
@@ -1088,6 +1101,7 @@ func (mc *ModbusClient) WriteFileRecord(fileData FileDataBlock) (err error) {
 		for i, v := range res.payload {
 			if v != req.payload[i] {
 				err = ErrProtocolError
+				mc.logger.Warningf("payload of the response is not same as that of the request")
 				return
 			}
 		}
