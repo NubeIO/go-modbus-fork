@@ -1090,19 +1090,31 @@ func (mc *ModbusClient) WriteFileRecord(fileDataBlocks []FileDataBlock) (err err
 	// validate the response code
 	switch {
 	case res.functionCode == req.functionCode:
-		// make sure the payload length of the response is same as that of the request
-		if len(res.payload) != len(req.payload) {
+		// response data length must be 1 byte or same as the request data length
+		// + If 1 byte (non-compliant to modbus standard), it must be 0x00 to indicate no data validation is required
+		// + If same as request data length (compliant to modbus standard): see the Modbus Application Protocol Specification
+		payloadLen := len(res.payload)
+		if payloadLen != 1 && payloadLen != len(req.payload) {
 			err = ErrProtocolError
-			mc.logger.Warningf("payload length of the response (%d) is not same as that of the request", res.payload)
+			mc.logger.Warningf("unexpected response payload length (%d)", payloadLen)
 			return
 		}
 
-		// the response PDU must be exactly same as the request PDU
-		for i, v := range res.payload {
-			if v != req.payload[i] {
-				err = ErrProtocolError
-				mc.logger.Warningf("payload of the response is not same as that of the request")
-				return
+		// If response data length is 1 byte, it must be 0x00
+		if payloadLen == 1 && res.payload[0] != 0x00 {
+			err = ErrProtocolError
+			mc.logger.Warningf("unexpected response data (%d)", res.payload[0])
+			return
+		}
+
+		// If response data length is same as request data length, it must be the echo of the request data
+		if payloadLen == len(req.payload) {
+			for i, v := range res.payload {
+				if v != req.payload[i] {
+					err = ErrProtocolError
+					mc.logger.Warningf("payload of the response is not same as that of the request")
+					return
+				}
 			}
 		}
 
